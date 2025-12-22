@@ -1,0 +1,107 @@
+import os
+import io
+import qrcode
+from flask import Flask, render_template, request, send_file, abort
+from PIL import Image, ImageDraw
+from werkzeug.utils import secure_filename
+
+# --- IMPORT RATE LIMITER ---
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+
+app = Flask(__name__)
+
+# --- KONFIGURASI KEAMANAN ---
+app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024  # Max 2MB
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg'}
+
+# --- INISIALISASI RATE LIMITER ---
+limiter = Limiter(
+    get_remote_address, # Mengidentifikasi pengguna berdasarkan alamat IP
+    app=app,
+    default_limits=["200 per day", "50 per hour"], # Batas umum aplikasi
+    storage_uri="memory://", # Penyimpanan data limit di RAM (cocok untuk web kecil)
+)
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def create_qr_with_logo(data, logo_file):
+    if len(data) > 500:
+        raise ValueError("Teks/URL terlalu panjang!")
+
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_H,
+        box_size=10,
+        border=4,
+    )
+    qr.add_data(data)
+    qr.make(fit=True)
+
+    qr_img = qr.make_image(fill_color="black", back_color="white").convert('RGB')
+    
+    try:
+        logo = Image.open(logo_file)
+        logo.verify() 
+        logo = Image.open(logo_file) 
+    except Exception:
+        raise ValueError("File yang diunggah bukan gambar yang valid.")
+
+    qr_width, qr_height = qr_img.size
+    white_box_size = int(qr_width * 0.3)
+    logo_size = int(qr_width * 0.22)
+    
+    draw = ImageDraw.Draw(qr_img)
+    box_pos = [
+        (qr_width - white_box_size) // 2,
+        (qr_height - white_box_size) // 2,
+        (qr_width + white_box_size) // 2,
+        (qr_height + white_box_size) // 2
+    ]
+    draw.rectangle(box_pos, fill="white")
+
+    logo = logo.resize((logo_size, logo_size), Image.LANCZOS)
+    logo_pos = ((qr_width - logo_size) // 2, (qr_height - logo_size) // 2)
+    
+    if logo.mode == 'RGBA':
+        qr_img.paste(logo, logo_pos, logo)
+    else:
+        qr_img.paste(logo, logo_pos)
+
+    img_io = io.BytesIO()
+    qr_img.save(img_io, 'PNG')
+    img_io.seek(0)
+    return img_io
+
+@app.route('/', methods=['GET', 'POST'])
+@limiter.limit("5 per minute") # --- FITUR KEAMANAN: Max 5 QR per menit per IP ---
+def index():
+    if request.method == 'POST':
+        data = request.form.get('data')
+        logo = request.files.get('logo')
+        
+        if not data or not logo or not allowed_file(logo.filename):
+            return "Input tidak valid atau format file dilarang!", 400
+        
+        try:
+            qr_file = create_qr_with_logo(data, logo)
+            return send_file(
+                qr_file, 
+                mimetype='image/png', 
+                as_attachment=True, 
+                download_name="qr_secure.png"
+            )
+        except Exception as e:
+            return str(e), 400
+            
+    return render_template('index.html')
+
+# Handler jika user terkena Rate Limit
+@app.errorhandler(429)
+def ratelimit_handler(e):
+    return "Terlalu banyak permintaan! Silakan coba lagi dalam satu menit.", 429
+
+if __name__ == '__main__':
+    app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024
+    app.run(debug=False)
